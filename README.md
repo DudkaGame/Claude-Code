@@ -111,6 +111,8 @@ tail -f /var/log/aeroflot-bot/run.log
 | Возобновить | `sudo systemctl enable --now aeroflot-check.timer` |
 | Посмотреть лог последнего прогона | `sudo journalctl -u aeroflot-check.service -n 100` |
 | Сбросить антидубликат | `sudo -u aeroflot /opt/aeroflot-bot/.venv/bin/python /opt/aeroflot-bot/check_tickets.py --reset-state` |
+| Статистика по всем датам | `sudo -u aeroflot /opt/aeroflot-bot/.venv/bin/python /opt/aeroflot-bot/check_tickets.py --stats` |
+| История по одной дате | `sudo -u aeroflot /opt/aeroflot-bot/.venv/bin/python /opt/aeroflot-bot/check_tickets.py --history 2026-08-20` |
 | Обновить конфиг | отредактировать `/opt/aeroflot-bot/config.json`, перезапуск не нужен |
 | Обновить код | залить новый `check_tickets.py` в `/opt/aeroflot-bot/` (owner — aeroflot) |
 

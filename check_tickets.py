@@ -380,9 +380,17 @@ async def fetch_itineraries(page, body: dict) -> tuple[int, Any]:
 
 
 def append_scan_record(
-    flights: list["FoundFlight"], min_prices: dict[str, int | None]
+    flights: list["FoundFlight"],
+    min_prices: dict[str, int | None],
+    probed_legs: list[tuple[str, str]] | None = None,
 ) -> None:
-    """Append one JSON line with this run's per-(date,direction) match counts.
+    """Append one JSON line with this run's per-(date,direction) results.
+
+    ``probed_legs`` is the full list of ``(leg_date, direction)`` pairs the
+    run attempted to fetch — including ones that returned 0 matches. We
+    record all of them so historical stats can answer "how many times did
+    the bot check date X" honestly (not just "how many times did X have
+    available seats").
 
     File: ``$AEROFLOT_LOG_DIR/scans.jsonl`` — one record per run, e.g.::
 
@@ -394,12 +402,19 @@ def append_scan_record(
     counts: dict[tuple[str, str], int] = {}
     for f in flights:
         counts[(f.leg_date, f.direction)] = counts.get((f.leg_date, f.direction), 0) + 1
+
+    # Union of probed legs and legs that had matches — so a leg the run
+    # attempted but got zero matches on still appears as count=0.
+    all_keys: set[tuple[str, str]] = set(counts.keys())
+    if probed_legs:
+        all_keys.update(probed_legs)
+
     by_leg = []
-    for (leg_date, direction), n in sorted(counts.items()):
+    for (leg_date, direction) in sorted(all_keys):
         by_leg.append({
             "date": leg_date,
             "direction": direction,
-            "count": n,
+            "count": counts.get((leg_date, direction), 0),
             "min_price": min_prices.get(f"{direction} {leg_date}"),
         })
     now_local = datetime.now().astimezone()
@@ -441,6 +456,105 @@ def load_scan_history(target_date: str) -> list[dict[str, Any]]:
                         "min_price": leg.get("min_price"),
                     })
     return rows
+
+
+def _read_scans_jsonl() -> list[dict[str, Any]]:
+    if not SCANS_PATH.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    with SCANS_PATH.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def build_stats(cfg: dict[str, Any]) -> str:
+    """Aggregate scans.jsonl into a per-(date, direction) summary.
+
+    For every (date, direction) pair currently configured, count how many
+    times the bot probed it, how many of those probes saw ≥1 subsidized
+    seat, the maximum match count, the lowest subsidized price observed,
+    and the most recent probe timestamp. Dates the bot never scanned
+    (e.g. just added to config) appear as "(нет данных)".
+    """
+    records = _read_scans_jsonl()
+
+    # Build aggregate per (date, direction). Source of truth for *which*
+    # pairs to show is the current config, not whatever happens to be in
+    # scans.jsonl — that way newly added dates appear as "no data yet".
+    origin = cfg.get("origin", "MOW")
+    destination = cfg.get("destination", "VVO")
+    expected: list[tuple[str, str]] = []
+    for d in cfg.get("dates_outbound", []):
+        expected.append((d, f"{origin}→{destination}"))
+    for d in cfg.get("dates_return", []):
+        expected.append((d, f"{destination}→{origin}"))
+
+    agg: dict[tuple[str, str], dict[str, Any]] = {
+        key: {"probes": 0, "with_match": 0, "max_count": 0,
+              "min_price": None, "last_ts": None, "last_count": 0}
+        for key in expected
+    }
+
+    for rec in records:
+        ts = rec.get("msk") or rec.get("ts")
+        for leg in rec.get("by_leg", []):
+            d = leg.get("date")
+            direction = leg.get("direction")
+            if (d, direction) not in agg:
+                continue
+            count = int(leg.get("count") or 0)
+            mp = leg.get("min_price")
+            row = agg[(d, direction)]
+            row["probes"] += 1
+            if count > 0:
+                row["with_match"] += 1
+            if count > row["max_count"]:
+                row["max_count"] = count
+            if isinstance(mp, int) and mp > 0:
+                if row["min_price"] is None or mp < row["min_price"]:
+                    row["min_price"] = mp
+            if ts and (row["last_ts"] is None or ts > row["last_ts"]):
+                row["last_ts"] = ts
+                row["last_count"] = count
+
+    # Pretty print
+    if not records:
+        return "Истории сканирований ещё нет (файл scans.jsonl пуст)."
+
+    lines = [
+        f"📊 Статистика появлений билетов "
+        f"(всего прогонов: {len(records)})",
+        "",
+        f"{'Дата':<12} {'Направление':<10} {'Скан.':>6} {'≥1 место':>9} {'Макс.':>6} {'Мин.цена':>10} {'Посл. скан':<17}",
+    ]
+    for key in expected:
+        d, direction = key
+        row = agg[key]
+        probes = row["probes"]
+        if probes == 0:
+            lines.append(f"{d:<12} {direction:<10} {'(нет данных — дата только что добавлена)':<60}")
+            continue
+        last_ts = (row["last_ts"] or "").replace("T", " ")[:16]
+        price = row["min_price"]
+        price_s = f"{price:>7,} ₽".replace(",", " ") if price else "       —"
+        lines.append(
+            f"{d:<12} {direction:<10} {probes:>6} {row['with_match']:>9} "
+            f"{row['max_count']:>6} {price_s:>10} {last_ts:<17}"
+        )
+    lines.append("")
+    lines.append("Колонки:")
+    lines.append("  Скан.    — сколько раз бот опрашивал API по этой дате")
+    lines.append("  ≥1 место — в скольки из них нашлось хоть одно субсидированное место")
+    lines.append("  Макс.    — наибольшее число найденных рейсов за один прогон")
+    lines.append("  Мин.цена — самая низкая зафиксированная цена обычного тарифа (₽)")
+    return "\n".join(lines)
 
 
 def format_history_text(target_date: str, rows: list[dict[str, Any]]) -> str:
@@ -541,6 +655,7 @@ async def run_check(cfg: dict[str, Any], dry_run: bool) -> int:
     state = load_state()
     all_found: list[FoundFlight] = []
     min_prices: dict[str, int | None] = {}
+    probed_legs: list[tuple[str, str]] = []
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
@@ -569,6 +684,7 @@ async def run_check(cfg: dict[str, Any], dry_run: bool) -> int:
             ]
 
             for o, d, leg_date, direction in legs:
+                probed_legs.append((leg_date, direction))
                 body = {
                     "program_id": program_id,
                     "routes": [
@@ -627,7 +743,9 @@ async def run_check(cfg: dict[str, Any], dry_run: bool) -> int:
 
     # Persistent per-scan history (one JSON object per line) for offline
     # querying: how many matches were there for a given date over time.
-    append_scan_record(all_found, min_prices)
+    # Includes zero-match legs too, so stats can answer "how many times
+    # did we probe date X".
+    append_scan_record(all_found, min_prices, probed_legs=probed_legs)
 
     # Refresh state.json — kept in sync with reality even though delivery
     # no longer depends on it (every run sends a summary).
@@ -676,6 +794,11 @@ def main() -> int:
         metavar="YYYY-MM-DD",
         help="print scan history for a specific departure date and exit",
     )
+    ap.add_argument(
+        "--stats",
+        action="store_true",
+        help="print aggregate statistics across all configured dates and exit",
+    )
     args = ap.parse_args()
 
     log_path = setup_logging()
@@ -693,6 +816,10 @@ def main() -> int:
         rows = load_scan_history(args.history)
         text = format_history_text(args.history, rows)
         print(text)
+        return 0
+
+    if args.stats:
+        print(build_stats(cfg))
         return 0
 
     if args.self_check:
