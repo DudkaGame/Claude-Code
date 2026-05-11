@@ -1,0 +1,14 @@
+[Unit]
+Description=Aeroflot subsidized tickets check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=aeroflot
+WorkingDirectory=/opt/aeroflot-bot
+Environment=AEROFLOT_LOG_DIR=/var/log/aeroflot-bot
+ExecStart=/opt/aeroflot-bot/.venv/bin/python /opt/aeroflot-bot/check_tickets.py
+StandardOutput=append:/var/log/aeroflot-bot/run.log
+StandardError=append:/var/log/aeroflot-bot/run.log
+TimeoutStartSec=15min

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Aeroflot check 3x daily (08:00, 14:00, 19:00 MSK)
+
+[Timer]
+OnCalendar=*-*-* 08,14,19:00:00 Europe/Moscow
+Persistent=true
+RandomizedDelaySec=2min
+Unit=aeroflot-check.service
+
+[Install]
+WantedBy=timers.target

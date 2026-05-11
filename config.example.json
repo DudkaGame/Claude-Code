@@ -1,0 +1,13 @@
+{
+  "origin": "MOW",
+  "destination": "VVO",
+  "dates_outbound": ["2026-08-16", "2026-08-17", "2026-08-18", "2026-08-19"],
+  "dates_return":   ["2026-08-31", "2026-09-01", "2026-09-02", "2026-09-03"],
+  "passengers": 5,
+  "min_seats": 5,
+  "category": "Молодёжь и пенсионеры",
+  "telegram": {
+    "bot_token": "PUT_BOT_TOKEN_FROM_BOTFATHER_HERE",
+    "chat_id": "PUT_YOUR_CHAT_ID_HERE"
+  }
+}
