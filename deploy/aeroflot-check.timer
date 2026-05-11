@@ -1,8 +1,8 @@
 [Unit]
-Description=Run Aeroflot check 3x daily (08:00, 14:00, 19:00 MSK)
+Description=Run Aeroflot check 4x daily (09:00, 12:00, 16:00, 20:00 MSK)
 
 [Timer]
-OnCalendar=*-*-* 08,14,19:00:00 Europe/Moscow
+OnCalendar=*-*-* 09,12,16,20:00:00 Europe/Moscow
 Persistent=true
 RandomizedDelaySec=2min
 Unit=aeroflot-check.service
