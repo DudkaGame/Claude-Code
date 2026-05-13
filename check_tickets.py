@@ -41,6 +41,10 @@ from playwright.async_api import async_playwright
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 STATE_PATH = SCRIPT_DIR / "state.json"
+# Snapshot of the previous run's flights, used to compute per-run diffs
+# ("appeared / disappeared since last check"). Stored next to state.json
+# because it's state, not a log. Cleared by --reset-state.
+LAST_FLIGHTS_PATH = SCRIPT_DIR / "last_flights.json"
 LOG_DIR = Path(os.environ.get("AEROFLOT_LOG_DIR", SCRIPT_DIR / "logs"))
 SCANS_PATH = LOG_DIR / "scans.jsonl"
 
@@ -87,6 +91,81 @@ def format_flights_message(flights: list["FoundFlight"]) -> str:
         f"{_ddmmyyyy(d)} {direction}: {n}"
         for (d, direction), n in sorted(counts.items())
     )
+
+
+# --------------------------------------------------------------------------- #
+# Diff vs previous run
+# --------------------------------------------------------------------------- #
+
+
+def load_last_flights() -> tuple[set[str], bool]:
+    """Load the previous run's flight keys.
+
+    Returns ``(keys, exists)`` — ``exists`` is False on the very first run
+    (no snapshot file yet), which the caller uses to suppress the diff
+    section so the first message doesn't claim every flight just appeared.
+    """
+    if not LAST_FLIGHTS_PATH.exists():
+        return set(), False
+    try:
+        with LAST_FLIGHTS_PATH.open(encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return set(), False
+    keys = data.get("keys") if isinstance(data, dict) else None
+    if not isinstance(keys, list):
+        return set(), False
+    return set(str(k) for k in keys), True
+
+
+def save_last_flights(flights: list["FoundFlight"]) -> None:
+    """Persist the current flight set as the next run's reference snapshot."""
+    payload = {
+        "ts": datetime.now(MSK).isoformat(timespec="seconds"),
+        "keys": sorted(f.key() for f in flights),
+    }
+    LAST_FLIGHTS_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _format_flight_key(key: str) -> str:
+    """``2026-08-23|MOW→VVO|1701`` -> ``23/08/2026 MOW→VVO рейс 1701``."""
+    parts = key.split("|", 2)
+    if len(parts) != 3:
+        return key
+    return f"{_ddmmyyyy(parts[0])} {parts[1]} рейс {parts[2]}"
+
+
+def format_diff(
+    current: list["FoundFlight"],
+    previous_keys: set[str],
+    previous_exists: bool,
+) -> str:
+    """Build the "diff since last check" block appended to every message.
+
+    Format:
+      * first ever run → ``Отличий по рейсам - 0 (первая проверка)``
+      * no change      → ``Отличий по рейсам - 0``
+      * change         → header + one ``+`` line per new flight + one
+                         ``-`` line per disappeared flight, sorted.
+    """
+    if not previous_exists:
+        return "Отличий по рейсам - 0 (первая проверка)"
+
+    current_keys = {f.key() for f in current}
+    appeared = sorted(current_keys - previous_keys)
+    disappeared = sorted(previous_keys - current_keys)
+
+    if not appeared and not disappeared:
+        return "Отличий по рейсам - 0"
+
+    lines = ["Отличия от прошлой проверки:"]
+    for k in appeared:
+        lines.append(f"+ появился {_format_flight_key(k)}")
+    for k in disappeared:
+        lines.append(f"- пропал {_format_flight_key(k)}")
+    return "\n".join(lines)
 
 
 def setup_logging() -> Path:
@@ -762,15 +841,24 @@ async def run_check(cfg: dict[str, Any], dry_run: bool) -> int:
     # match count. If nothing matches at all, send a short "no matches" note
     # so the user can see the bot still ran.
     if all_found:
-        message = format_flights_message(all_found)
+        summary = format_flights_message(all_found)
     else:
-        message = "Совпадений нет."
+        summary = "Совпадений нет."
+
+    # Diff against the previous run's flight set, so each message tells the
+    # user at a glance what's new since last check. Computed before saving
+    # the new snapshot below.
+    prev_keys, prev_exists = load_last_flights()
+    diff_block = format_diff(all_found, prev_keys, prev_exists)
+    message = f"{summary}\n\n{diff_block}"
 
     if dry_run:
         logging.info("[dry-run] would send:\n%s", message)
         return 0
 
     send_telegram(cfg, message)
+    # Snapshot the current flight set so the *next* run can diff against it.
+    save_last_flights(all_found)
     logging.info("summary sent (%d flights across %d legs)",
                  len(all_found),
                  len({(f.leg_date, f.direction) for f in all_found}))
@@ -809,6 +897,8 @@ def main() -> int:
     if args.reset_state:
         if STATE_PATH.exists():
             STATE_PATH.unlink()
+        if LAST_FLIGHTS_PATH.exists():
+            LAST_FLIGHTS_PATH.unlink()
         logging.info("state reset")
         return 0
 

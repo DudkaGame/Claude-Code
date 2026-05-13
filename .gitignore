@@ -1,5 +1,6 @@
 config.json
 state.json
+last_flights.json
 logs/
 .venv/
 __pycache__/
