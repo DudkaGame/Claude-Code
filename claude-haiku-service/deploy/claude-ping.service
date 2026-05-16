@@ -1,0 +1,11 @@
+[Unit]
+Description=Claude Haiku Keepalive Ping
+After=network.target
+
+[Service]
+Type=oneshot
+User=claude-ping
+EnvironmentFile=/etc/claude-ping/env
+ExecStart=/opt/claude-ping/ping.sh
+StandardOutput=append:/var/log/claude-ping/run.log
+StandardError=append:/var/log/claude-ping/run.log
