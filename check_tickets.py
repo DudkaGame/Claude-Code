@@ -68,6 +68,13 @@ class FoundFlight:
     price: int | None
     departure: str | None
     arrival: str | None
+    # Operating carrier when it differs from the marketing carrier (SU).
+    # E.g. "FV Россия" for SU6293 → operated by Rossiya as FV6293, or
+    # "iFly (франшиза)" for SU58xx. None means "real Aeroflot metal".
+    operator: str | None = None
+    # Number of physical segments in the itinerary. 1 = direct flight,
+    # >1 = at least one connection. Direct-only is the default filter.
+    segments: int = 1
 
     def key(self) -> str:
         return f"{self.leg_date}|{self.direction}|{self.flight_no}"
@@ -82,15 +89,44 @@ def _ddmmyyyy(iso_date: str) -> str:
         return iso_date
 
 
+def _hhmm(ts: str | None) -> str:
+    """'2026-08-29 01:20' -> '01:20'. Returns '' for unparseable input."""
+    if not ts or " " not in ts:
+        return ""
+    return ts.split(" ", 1)[1][:5]
+
+
 def format_flights_message(flights: list["FoundFlight"]) -> str:
-    """Compact summary: one line per (date, direction) with the match count."""
-    counts: dict[tuple[str, str], int] = {}
-    for f in flights:
-        counts[(f.leg_date, f.direction)] = counts.get((f.leg_date, f.direction), 0) + 1
-    return "\n".join(
-        f"{_ddmmyyyy(d)} {direction}: {n}"
-        for (d, direction), n in sorted(counts.items())
-    )
+    """One line per flight with enough detail to verify on the site.
+
+    Previously this only showed a count per (date, direction). That was
+    too lossy: when the user opened the Aeroflot site to book, they
+    couldn't tell which of the N flights the bot meant, and any
+    inaccuracy (codeshare counted as real, e.g.) was invisible.
+
+    New format:
+        21/08/2026 MOW→VVO SU1700 15:40  9 мест, 37 000 ₽
+        29/08/2026 MOW→VVO SU1708 01:20  9 мест, 37 000 ₽
+
+    Codeshare/franchise flights, if ever surfaced (off by default), get an
+    "(оператор: …)" suffix so they're visually distinct from real SU
+    flights.
+    """
+    lines: list[str] = []
+    for f in sorted(flights, key=lambda x: (x.leg_date, x.direction, x.departure or "")):
+        time_str = _hhmm(f.departure)
+        seats_str = f"{f.seats} мест" if f.seats is not None else "места есть"
+        if f.price:
+            price_str = f", {f.price:,} ₽".replace(",", " ")
+        else:
+            price_str = ""
+        op_str = f"  (оператор: {f.operator})" if f.operator else ""
+        seg_str = f"  ({f.segments} сегмента)" if f.segments > 1 else ""
+        lines.append(
+            f"{_ddmmyyyy(f.leg_date)} {f.direction} {f.flight_no} {time_str}  "
+            f"{seats_str}{price_str}{op_str}{seg_str}"
+        )
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -350,80 +386,177 @@ def _as_int(v: Any) -> int | None:
 
 
 def extract_flights(
-    payload: Any, direction: str, leg_date: str, min_seats: int
+    payload: Any,
+    direction: str,
+    leg_date: str,
+    min_seats: int,
+    *,
+    airline_code: str = "SU",
+    passenger_type: str = "youth",
+    passenger_qty: int = 1,
+    allow_codeshare: bool = False,
+    allow_connections: bool = False,
 ) -> list[FoundFlight]:
+    """Parse the Aeroflot subsidized-search response into bookable flights.
+
+    Response shape (as of May 2026):
+        data.route_itineraries[0]  ->  list of itineraries for the queried route
+        itinerary.legs[i].segments[j]
+            -> the actual flight: marketing_flight_number,
+               operating_flight_number, marketing_airline_code,
+               operating_airline_code, departure, arrival, …
+        itinerary.offers[k]
+            -> fare offer: seat_quantity, price_total_amount,
+               passenger_prices[*].passenger_type_code, …
+
+    The old implementation walked the whole tree looking for any node with
+    a "flight_number"-ish key, then read seats off the SAME node. That was
+    wrong on two counts:
+
+    1. seats live on `offers`, NOT on segments — so the min_seats filter
+       was effectively bypassed (seats came back as None, which the old
+       code treated as "pass").
+
+    2. it counted every segment as a separate match — so codeshare flights
+       operated by Rossiya (FVxxxx as SU6xxx) and iFly franchise flights
+       (SU58xx) showed up as bookable Aeroflot rows, when in fact they're
+       either invisible on the Aeroflot site or only bookable under the
+       partner's code. This is the "рейсы которых нет на сайте" bug.
+
+    The rewrite walks the documented structure, applies meaningful filters
+    (codeshare-off and direct-only by default), and reads seats / price
+    from the right place.
+    """
     found: list[FoundFlight] = []
 
-    def seats_of(obj: dict) -> int | None:
-        for key in (
-            "seats_available",
-            "seatsAvailable",
-            "availableSeats",
-            "seats",
-            "countSeats",
-            "availability",
-            "available",
-            "free_seats",
-            "subsidized_seats",
-        ):
-            v = obj.get(key)
-            n = _as_int(v)
-            if n is not None:
-                return n
-        return None
+    # Navigate to the inner itinerary list. Tolerate a few legacy shapes
+    # in case the API ever changes: payload may already be the inner list,
+    # or it may be the outer list-of-lists, or it may be wrapped in {data: …}.
+    inner: list[Any] = []
+    if isinstance(payload, list):
+        if payload and isinstance(payload[0], list):
+            inner = payload[0]
+        elif payload and isinstance(payload[0], dict):
+            inner = payload
+    elif isinstance(payload, dict):
+        ri = (payload.get("data") or payload).get("route_itineraries")
+        if isinstance(ri, list) and ri and isinstance(ri[0], list):
+            inner = ri[0]
 
-    def price_of(obj: dict) -> int | None:
-        for key in ("price_amount", "price", "amount", "totalPrice", "fare", "total"):
-            v = obj.get(key)
-            n = _as_int(v)
-            if n is not None:
-                return n
-            if isinstance(v, dict):
-                inner = price_of(v)
-                if inner is not None:
-                    return inner
-        return None
+    for itin in inner:
+        if not isinstance(itin, dict):
+            continue
+        legs = itin.get("legs") or []
+        offers = itin.get("offers") or []
+        if not legs or not offers:
+            continue
 
-    def walk(node: Any) -> None:
-        if isinstance(node, dict):
-            flight_no = (
-                node.get("flight_number")
-                or node.get("flightNumber")
-                or node.get("flightNo")
-                or node.get("number")
-                or node.get("marketing_flight_number")
-            )
-            dep = (
-                node.get("departure_time")
-                or node.get("departureTime")
-                or node.get("departure")
-            )
-            arr = (
-                node.get("arrival_time")
-                or node.get("arrivalTime")
-                or node.get("arrival")
-            )
-            if flight_no:
-                seats = seats_of(node)
-                if seats is None or seats >= min_seats:
-                    found.append(
-                        FoundFlight(
-                            leg_date=leg_date,
-                            direction=direction,
-                            flight_no=str(flight_no),
-                            seats=seats,
-                            price=price_of(node),
-                            departure=str(dep) if dep else None,
-                            arrival=str(arr) if arr else None,
-                        )
-                    )
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
+        # ---- Walk segments to characterise the physical flight chain. ----
+        segments_meta: list[dict[str, Any]] = []
+        for leg in legs:
+            for seg in leg.get("segments") or []:
+                segments_meta.append(seg)
 
-    walk(payload)
+        if not segments_meta:
+            continue
+
+        # Direct-only filter: a single segment with no stops.
+        is_direct = (len(segments_meta) == 1
+                     and not _as_int(segments_meta[0].get("stop_quantity") or 0))
+        if not is_direct and not allow_connections:
+            continue
+
+        # Codeshare / franchise filter:
+        #   - franchise_info on the leg means "operated by partner under SU code"
+        #     (e.g. iFly for SU5800–5949)
+        #   - marketing != operating airline code means classic codeshare
+        #     (e.g. SU6293 actually flown as FV6293 by Rossiya)
+        # Both look identical on Aeroflot's site (you may not see them at all
+        # under the SU code, or you'll see them with a partner badge that
+        # confuses the user), so by default we exclude them.
+        first_seg = segments_meta[0]
+        mk_code = first_seg.get("marketing_airline_code")
+        op_code = first_seg.get("operating_airline_code")
+        op_name = first_seg.get("operating_airline_name")
+        franchise = any((leg.get("franchise_info") or []) for leg in legs)
+        is_codeshare = mk_code != op_code or franchise
+        if is_codeshare and not allow_codeshare:
+            continue
+
+        # Wrong marketing airline (the bot is configured for SU). Defensive —
+        # subsidized API shouldn't return non-SU, but keep the guard.
+        if mk_code and mk_code != airline_code and not allow_codeshare:
+            continue
+
+        # ---- Compose the human-facing flight identifier across segments ----
+        flight_no_parts: list[str] = []
+        for seg in segments_meta:
+            fn = (seg.get("marketing_flight_number")
+                  or seg.get("operating_flight_number"))
+            code = seg.get("marketing_airline_code") or airline_code
+            if fn:
+                flight_no_parts.append(f"{code}{fn}")
+        flight_no_str = "+".join(flight_no_parts) if flight_no_parts else "?"
+
+        # Operator note when not pure Aeroflot — kept on the dataclass so
+        # downstream code (Telegram message, state.json key) can disambiguate.
+        operator_note: str | None = None
+        if franchise:
+            operator_note = "франшиза"
+        elif mk_code != op_code:
+            operator_note = f"{op_code} {op_name}".strip() if op_code else None
+
+        # ---- Pick the best offer for our passenger group ----
+        # The subsidized API returns one offer per fare brand. We want the
+        # one that:
+        #   1. covers our passenger type (youth/senior/etc.)
+        #   2. has enough seats for our group
+        #   3. is the cheapest among the candidates
+        def offer_covers(o: dict) -> bool:
+            pps = o.get("passenger_prices") or []
+            for p in pps:
+                if (p.get("passenger_type_code") == passenger_type
+                    and _as_int(p.get("passenger_quantity") or 0)
+                        and (_as_int(p.get("passenger_quantity")) or 0)
+                            >= passenger_qty):
+                    return True
+            # If passenger_prices is empty or doesn't list a quantity, fall
+            # back to the offer-level seat_quantity check below.
+            return not pps
+
+        candidate_offers = [o for o in offers if offer_covers(o)]
+        if not candidate_offers:
+            candidate_offers = offers  # last-resort fallback
+
+        max_seats = max((_as_int(o.get("seat_quantity")) or 0
+                         for o in candidate_offers), default=0)
+        if max_seats < min_seats:
+            continue  # not enough seats — skip
+
+        min_price = None
+        for o in candidate_offers:
+            p = _as_int(o.get("price_total_amount")
+                        or o.get("price_base_amount"))
+            if p is None:
+                continue
+            if min_price is None or p < min_price:
+                min_price = p
+
+        dep_raw = first_seg.get("departure")
+        arr_raw = segments_meta[-1].get("arrival")
+
+        found.append(FoundFlight(
+            leg_date=leg_date,
+            direction=direction,
+            flight_no=flight_no_str,
+            seats=max_seats,
+            price=min_price,
+            departure=str(dep_raw) if dep_raw else None,
+            arrival=str(arr_raw) if arr_raw else None,
+            operator=operator_note,
+            segments=len(segments_meta),
+        ))
+
     return found
 
 
@@ -730,6 +863,13 @@ async def run_check(cfg: dict[str, Any], dry_run: bool) -> int:
     passenger_type = cfg.get("passenger_type", "youth")
     outbound_dates = cfg["dates_outbound"]
     return_dates = cfg["dates_return"]
+    # Accuracy filters (defaults match "what's actually visible/bookable
+    # on aeroflot.ru for an ordinary passenger"). Override in config.json
+    # only if you intentionally want codeshare / connecting itineraries
+    # included in alerts.
+    airline_code = cfg.get("airline_code", "SU")
+    allow_codeshare = bool(cfg.get("allow_codeshare", False))
+    allow_connections = bool(cfg.get("allow_connections", False))
 
     state = load_state()
     all_found: list[FoundFlight] = []
@@ -801,13 +941,29 @@ async def run_check(cfg: dict[str, Any], dry_run: bool) -> int:
                         if dd == leg_date and pa is not None:
                             min_prices[f"{direction} {leg_date}"] = pa
 
-                leg_found = extract_flights(itins, direction, leg_date, min_seats)
+                leg_found = extract_flights(
+                    itins,
+                    direction,
+                    leg_date,
+                    min_seats,
+                    airline_code=airline_code,
+                    passenger_type=passenger_type,
+                    passenger_qty=passengers,
+                    allow_codeshare=allow_codeshare,
+                    allow_connections=allow_connections,
+                )
+                # itineraries=N is the count returned by the API (everything
+                # subsidized for this date), matches=M is what survived the
+                # accuracy filters (direct + non-codeshare + enough seats).
+                # The gap between the two is the most useful debug signal.
+                inner_len = (len(itins[0]) if (itins and isinstance(itins[0], list))
+                             else 0)
                 logging.info(
                     "%s %s: http=%s, itineraries=%d, matches=%d, min_price=%s",
                     direction,
                     leg_date,
                     status,
-                    len(itins),
+                    inner_len,
                     len(leg_found),
                     min_prices.get(f"{direction} {leg_date}"),
                 )
