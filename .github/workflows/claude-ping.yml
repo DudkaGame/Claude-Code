@@ -1,0 +1,18 @@
+name: Claude Haiku Ping
+
+on:
+  schedule:
+    - cron: '0 */5 * * *'   # каждые 5 часов: 00:00, 05:00, 10:00, 15:00, 20:00 UTC
+  workflow_dispatch:          # ручной запуск для теста
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Send ping to Claude Haiku
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: echo "." | claude --model claude-haiku-4-5 --print
