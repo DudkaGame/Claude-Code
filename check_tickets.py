@@ -90,43 +90,33 @@ def _ddmmyyyy(iso_date: str) -> str:
 
 
 def _hhmm(ts: str | None) -> str:
-    """'2026-08-29 01:20' -> '01:20'. Returns '' for unparseable input."""
+    """'2026-08-29 01:20' -> '01:20'. Returns '' for unparseable input.
+
+    Kept around because the per-flight detail formatter (now retired from
+    the main Telegram message) may still be useful elsewhere — e.g. the
+    diff block continues to render flight identifiers, and future debug
+    output may want the short time form.
+    """
     if not ts or " " not in ts:
         return ""
     return ts.split(" ", 1)[1][:5]
 
 
 def format_flights_message(flights: list["FoundFlight"]) -> str:
-    """One line per flight with enough detail to verify on the site.
+    """Compact summary: one line per (date, direction) with the match count.
 
-    Previously this only showed a count per (date, direction). That was
-    too lossy: when the user opened the Aeroflot site to book, they
-    couldn't tell which of the N flights the bot meant, and any
-    inaccuracy (codeshare counted as real, e.g.) was invisible.
-
-    New format:
-        21/08/2026 MOW→VVO SU1700 15:40  9 мест, 37 000 ₽
-        29/08/2026 MOW→VVO SU1708 01:20  9 мест, 37 000 ₽
-
-    Codeshare/franchise flights, if ever surfaced (off by default), get an
-    "(оператор: …)" suffix so they're visually distinct from real SU
-    flights.
+    Detail (which specific flights changed) is conveyed by the diff block
+    appended by format_diff(...), so we keep the header section short —
+    a Telegram notification is most useful when the *headline* number is
+    glanceable, and a tap reveals the deltas.
     """
-    lines: list[str] = []
-    for f in sorted(flights, key=lambda x: (x.leg_date, x.direction, x.departure or "")):
-        time_str = _hhmm(f.departure)
-        seats_str = f"{f.seats} мест" if f.seats is not None else "места есть"
-        if f.price:
-            price_str = f", {f.price:,} ₽".replace(",", " ")
-        else:
-            price_str = ""
-        op_str = f"  (оператор: {f.operator})" if f.operator else ""
-        seg_str = f"  ({f.segments} сегмента)" if f.segments > 1 else ""
-        lines.append(
-            f"{_ddmmyyyy(f.leg_date)} {f.direction} {f.flight_no} {time_str}  "
-            f"{seats_str}{price_str}{op_str}{seg_str}"
-        )
-    return "\n".join(lines)
+    counts: dict[tuple[str, str], int] = {}
+    for f in flights:
+        counts[(f.leg_date, f.direction)] = counts.get((f.leg_date, f.direction), 0) + 1
+    return "\n".join(
+        f"{_ddmmyyyy(d)} {direction}: {n}"
+        for (d, direction), n in sorted(counts.items())
+    )
 
 
 # --------------------------------------------------------------------------- #
