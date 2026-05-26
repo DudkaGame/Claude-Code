@@ -7,5 +7,10 @@ mkdir -p "$LOG_DIR"
 
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 echo "[$TIMESTAMP] --- ping ---" >> "$LOG_FILE"
-echo "." | claude --model claude-haiku-4-5 --print >> "$LOG_FILE" 2>&1
+
+if ! claude --continue --model claude-haiku-4-5 --print "." >> "$LOG_FILE" 2>&1; then
+    echo "[$TIMESTAMP] ERROR: claude --continue failed. Run 'claude' interactively once to create a starting session, then retry." >> "$LOG_FILE"
+    exit 1
+fi
+
 echo "[$TIMESTAMP] --- done ---" >> "$LOG_FILE"
